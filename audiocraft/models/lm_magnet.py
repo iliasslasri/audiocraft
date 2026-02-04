@@ -164,7 +164,9 @@ class MagnetLMModel(LMModel):
                          decoding_steps: tp.List[int] = [20, 10, 10, 10],
                          anneal_temp: bool = True,
                          span_scoring='max',
-                         span_arrangement='nonoverlap') -> torch.Tensor:
+                         span_arrangement='nonoverlap',
+                         mask_end_idx=None,
+                         mask_start_idx=None) -> torch.Tensor:
         """Generate audio tokens given textual conditions, and optionally given audio prompts,
         by running MAGNeT's iterative decoding algorithm for each of the n_q RVQ levels.
         Args:
@@ -224,7 +226,6 @@ class MagnetLMModel(LMModel):
 
         B, K, prompt_length = prompt.shape
         start_offset = prompt_length
-        assert start_offset < max_gen_len
 
         mask_id = self.special_token_id
 
@@ -233,7 +234,13 @@ class MagnetLMModel(LMModel):
 
         gen_codes = torch.full(shape, mask_id, dtype=torch.long, device=device)
         # filling the gen_codes with the prompt if needed
-        gen_codes[..., :start_offset] = prompt
+        if mask_end_idx is None:
+            assert start_offset < max_gen_len
+            gen_codes[..., :start_offset] = prompt
+        else:
+            assert mask_start_idx is not None, "Must provide start index for inpainting"
+            gen_codes[..., :mask_start_idx] = prompt[..., :mask_start_idx]
+            gen_codes[...,mask_end_idx:] = prompt[...,mask_end_idx:]
         # create the gen_sequence with proper interleaving from the pattern: [B, K, S]
         gen_sequence = gen_codes
 
@@ -257,7 +264,9 @@ class MagnetLMModel(LMModel):
                                                            span_arrangement=span_arrangement,
                                                            curr_step=curr_step,
                                                            total_steps=sum(decoding_steps),
-                                                           callback=callback)
+                                                           callback=callback,
+                                                           mask_start_idx=mask_start_idx, 
+                                                           mask_end_idx=mask_end_idx)
 
         return gen_sequence
 
@@ -281,7 +290,9 @@ class MagnetLMModel(LMModel):
                         span_arrangement: str = 'nonoverlap',
                         curr_step: int = 0,
                         total_steps: int = 0,
-                        callback: tp.Optional[tp.Callable[[int, int], None]] = None) -> tp.Tuple[torch.Tensor, int]:
+                        callback: tp.Optional[tp.Callable[[int, int], None]] = None,
+                        mask_start_idx: tp.Optional[int] = None,
+                        mask_end_idx: tp.Optional[int] = None) -> tp.Tuple[torch.Tensor, int]:
         """Generate audio tokens of a single RVQ level (stage), given the previously generated stages,
            and the textual conditions.
         Args:
@@ -339,8 +350,12 @@ class MagnetLMModel(LMModel):
         else:
             # token-wise scores
             scores = torch.zeros(shape, dtype=torch.float32, device=device)
-            scores[..., :prompt_length] = DONT_REMASK_ME_SCORE
-            gen_T = T - prompt_length
+            effective_start = mask_start_idx if mask_start_idx is not None else prompt_length
+            scores[..., :effective_start] = DONT_REMASK_ME_SCORE
+            
+            if mask_end_idx is not None:
+                scores[..., mask_end_idx:] = DONT_REMASK_ME_SCORE
+            gen_T = T - prompt_length if mask_start_idx is None else T - mask_start_idx - (T-mask_end_idx)
 
         # run MAGNeT iterative decoding for "timesteps" iterations
         for timestep, steps_left in zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))):
@@ -372,14 +387,18 @@ class MagnetLMModel(LMModel):
                     stage_gen_seq = stage_gen_seq.scatter(2, masked, mask_id)
 
             if prompt is not None:
-                stage_gen_seq[..., :prompt_length] = prompt[:, stage, :].unsqueeze(1)
-
+                if mask_end_idx is None:
+                    stage_gen_seq[..., :prompt_length] = prompt[:, stage, :].unsqueeze(1)
+                else:
+                    assert mask_start_idx is not None, "Must provide start index for inpainting"
+                    stage_gen_seq[..., :mask_start_idx] = prompt[:, stage, :mask_start_idx].unsqueeze(1)
+                    stage_gen_seq[...,mask_end_idx:] = prompt[:,stage, mask_end_idx:].unsqueeze(1)
             gen_sequence[:, [stage], :] = stage_gen_seq
             if condition_tensors:
                 # duplicate input for classifier free guidance
                 sequence = torch.cat([gen_sequence, gen_sequence], dim=0)
-
-            all_logits = model(sequence, [], condition_tensors, stage=stage)
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                all_logits = model(sequence, [], condition_tensors, stage=stage)
 
             if condition_tensors:
                 # classifier free guidance with annealing
