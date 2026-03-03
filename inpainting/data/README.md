@@ -1,0 +1,1 @@
+Data taken from *The Song Describer Dataset: a Corpus of Audio Captions for Music-and-Language Evaluation*, [link](https://github.com/mulab-mir/song-describer-dataset).

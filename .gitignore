@@ -5,6 +5,11 @@ __pycache__
 
 # C extensions
 *.so
+*.wav
+*.wav.wav
+plots/
+*.json
+*.csv
 
 # macOS dir files
 .DS_Store
