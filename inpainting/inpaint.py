@@ -9,8 +9,8 @@ from tqdm import tqdm
 import torch.nn.functional as F
 
 MODEL_NAME = 'facebook/magnet-medium-30secs' 
-SAMPLES_DIR = 'inpainted_magnet_entire_audio'
-OUTPUT_DIR = 'inpainted_samples_magnet_slight_change_min_max_cfg'  # 'inpainted_samples_magnet'
+SAMPLES_DIR = 'samples_magnet'
+OUTPUT_DIR = 'inpainted_magnet_entire_audio'  # 'inpainted_samples_magnet'
 DESCRIPTIONS_PATH = 'data/magnet_descriptions_slight_change.csv' # 'data/magnet_augmented_2.csv'
 NUM_SAMPLES = 16
 
@@ -77,8 +77,7 @@ def compute_metrics(metric, original_wav, inpainted_wav, target_desc, original_d
     }
     return metrics
 
-def inpaint(model_name=MODEL_NAME, output_dir=OUTPUT_DIR, samples_dir=SAMPLES_DIR, num_samples=NUM_SAMPLES, descriptions_path=DESCRIPTIONS_PATH):
-
+def inpaint(model_name=MODEL_NAME, output_dir=OUTPUT_DIR, samples_dir=SAMPLES_DIR, num_samples=NUM_SAMPLES, descriptions_path=DESCRIPTIONS_PATH, start_time=10.0, end_time=20.0):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading {model_name} on {device}...")
     model = MAGNeT.get_pretrained(model_name)
@@ -160,10 +159,8 @@ def inpaint(model_name=MODEL_NAME, output_dir=OUTPUT_DIR, samples_dir=SAMPLES_DI
 
         # Create the Zeroed version
         wav_with_silence = wav.clone()
-        start = 0.0
-        end = 30.0
-        gap_start_sample = int(start * model.sample_rate)
-        gap_end_sample = int(end * model.sample_rate)
+        gap_start_sample = int(start_time * model.sample_rate)
+        gap_end_sample = int(end_time * model.sample_rate)
         wav_with_silence[..., gap_start_sample:gap_end_sample] = 0
 
         with torch.no_grad():
@@ -172,8 +169,8 @@ def inpaint(model_name=MODEL_NAME, output_dir=OUTPUT_DIR, samples_dir=SAMPLES_DI
         # Define Mask Indices
         # MAGNET frame rate is usually 50 Hz
         frame_rate = model.compression_model.frame_rate 
-        mask_start_idx = int( start* frame_rate)
-        mask_end_idx = int(end * frame_rate)
+        mask_start_idx = int(start_time * frame_rate)
+        mask_end_idx = int(end_time * frame_rate)
 
         # Prepare Text Conditions
         attributes, prompt_tokens = model._prepare_tokens_and_attributes([desc], wav)
@@ -231,4 +228,11 @@ def inpaint(model_name=MODEL_NAME, output_dir=OUTPUT_DIR, samples_dir=SAMPLES_DI
     # print(f"Done!")
 
 if __name__=="__main__":
-    inpaint()
+    import argparse
+    parser = argparse.ArgumentParser(description="Run Audio Inpainting with MAGNeT")
+    parser.add_argument("--start", type=float, default=10.0, help="Start time in seconds for the mask")
+    parser.add_argument("--end", type=float, default=20.0, help="End time in seconds for the mask")
+    parser.add_argument("--output_dir", type=str, default=OUTPUT_DIR, help="Output directory name")
+    args = parser.parse_args()
+    
+    inpaint(start_time=args.start, end_time=args.end, output_dir=args.output_dir)
