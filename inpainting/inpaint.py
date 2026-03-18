@@ -90,7 +90,6 @@ def select_target_descriptions(clap_metric, descriptions, samples_metadata, top_
     return torch.topk(sim, k=top_k, dim=0).indices
 
 
-# Main pipeline 
 def inpaint(
     model_name=MODEL_NAME,
     output_dir=OUTPUT_DIR,
@@ -101,6 +100,7 @@ def inpaint(
     end_time=20.0,
     soft_mask_transition=0,
     position_aware_cfg=False,
+    batch_size=4,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(output_dir, exist_ok=True)
@@ -135,47 +135,56 @@ def inpaint(
     mask_start_idx = int(start_time * frame_rate)
     mask_end_idx = int(end_time * frame_rate)
 
-    #  Run inpainting 
+    #  Run inpainting in batches 
     all_metrics = []
     all_generated_wavs = []  # for FAD
     all_reference_wavs = []  # for FAD
 
-    for idx in range(num_samples):
-        original_desc = samples_metadata[idx]["prompt"]
-
-        # Pick target: most similar but different description
-        target_desc = descriptions[top_k_indices[0, idx].item()]
-        if target_desc == original_desc:
-            target_desc = descriptions[top_k_indices[1, idx].item()]
-
+    for batch_start in range(0, num_samples, batch_size):
+        batch_end = min(batch_start + batch_size, num_samples)
+        current_batch_size = batch_end - batch_start
+        
         print(f"\n{'='*60}")
-        print(f"Sample {idx}/{num_samples}")
-        print(f"  Original:  '{original_desc}'")
-        print(f"  Target:    '{target_desc}'")
+        print(f"Processing batch {batch_start//batch_size + 1} (samples {batch_start} to {batch_end-1})")
 
-        # Load and prepare audio
-        wav = load_and_prepare_audio(
-            f"{samples_dir}/{idx}.wav.wav", model, target_samples, device
-        )
+        batch_wavs = []
+        batch_target_descs = []
+        batch_original_descs = []
+
+        for idx in range(batch_start, batch_end):
+            original_desc = samples_metadata[idx]["prompt"]
+            target_desc = descriptions[top_k_indices[0, idx].item()]
+            if target_desc == original_desc:
+                target_desc = descriptions[top_k_indices[1, idx].item()]
+                
+            batch_original_descs.append(original_desc)
+            batch_target_descs.append(target_desc)
+
+            wav = load_and_prepare_audio(
+                f"{samples_dir}/{idx}.wav.wav", model, target_samples, device
+            )
+            batch_wavs.append(wav)
+            all_reference_wavs.append(wav.squeeze(0).cpu())
+
+        # Combine into batch tensors
+        # wav shape from load_and_prepare is [1, C, T], so cat along dim=0 -> [B, C, T]
+        batch_wav_tensor = torch.cat(batch_wavs, dim=0)
 
         # Encode with masked gap
-        wav_masked = wav.clone()
+        wav_masked = batch_wav_tensor.clone()
         wav_masked[..., gap_start_sample:gap_end_sample] = 0
         with torch.no_grad():
             prompt_tokens, _ = model.compression_model.encode(wav_masked)
 
         # Prepare conditions
         attributes, prompt_tokens = model._prepare_tokens_and_attributes(
-            [target_desc], wav
+            batch_target_descs, batch_wav_tensor
         )
         assert prompt_tokens is not None
 
-        # Collect reference for FAD
-        all_reference_wavs.append(wav.squeeze(0).cpu())
-
         # Sweep CFG scales
         with torch.no_grad():
-            for cfg_max in tqdm(CFG_MAX_SCALES, desc="max_cfg", leave=False):
+            for cfg_max in tqdm(CFG_MAX_SCALES, desc=f"Batch {batch_start//batch_size + 1} max_cfg", leave=False):
                 for cfg_min in CFG_MIN_SCALES:
                     if cfg_min >= cfg_max:
                         continue
@@ -194,29 +203,38 @@ def inpaint(
                         soft_mask_transition=soft_mask_transition,
                         position_aware_cfg=position_aware_cfg,
                     )
-                    out_wav = model.compression_model.decode(output_tokens, None)
+                    
+                    # Decode batch [B, K, S] -> [B, C, T]
+                    out_wavs = model.compression_model.decode(output_tokens, None)
 
-                    # Save a subset of audio files for listening
-                    if torch.rand(1).item() < SAVE_PROBABILITY:
-                        fname = f"{output_dir}/{idx}_cfg_{cfg_min}_{cfg_max}"
-                        audio_write(fname, out_wav[0].cpu(), model.sample_rate, strategy="loudness")
-                        print(f"  Saved {fname}.wav")
+                    for b_idx in range(current_batch_size):
+                        global_idx = batch_start + b_idx
+                        single_out_wav = out_wavs[b_idx:b_idx+1]
+                        single_orig_wav = batch_wav_tensor[b_idx:b_idx+1]
+                        
+                        target_desc = batch_target_descs[b_idx]
+                        original_desc = batch_original_descs[b_idx]
 
-                    # Compute all per-sample metrics
-                    metrics = compute_all_sample_metrics(
-                        clap, wav, out_wav,
-                        target_desc, original_desc, model.sample_rate,
-                        gap_start_sample, gap_end_sample,
-                    )
-                    metrics["sample_idx"] = idx
-                    metrics["max_cfg_scale"] = cfg_max
-                    metrics["min_cfg_scale"] = cfg_min
-                    metrics["original_description"] = original_desc
-                    metrics["target_description"] = target_desc
-                    all_metrics.append(metrics)
+                        # Save a subset of audio files for listening
+                        if torch.rand(1).item() < SAVE_PROBABILITY:
+                            fname = f"{output_dir}/{global_idx}_cfg_{cfg_min}_{cfg_max}"
+                            audio_write(fname, single_out_wav[0].cpu(), model.sample_rate, strategy="loudness")
 
-                    # Collect for FAD (one per CFG config)
-                    all_generated_wavs.append(out_wav.squeeze(0).cpu())
+                        # Compute all per-sample metrics
+                        metrics = compute_all_sample_metrics(
+                            clap, single_orig_wav, single_out_wav,
+                            target_desc, original_desc, model.sample_rate,
+                            gap_start_sample, gap_end_sample,
+                        )
+                        metrics["sample_idx"] = global_idx
+                        metrics["max_cfg_scale"] = cfg_max
+                        metrics["min_cfg_scale"] = cfg_min
+                        metrics["original_description"] = original_desc
+                        metrics["target_description"] = target_desc
+                        all_metrics.append(metrics)
+
+                        # Collect for FAD (one per CFG config per sample)
+                        all_generated_wavs.append(single_out_wav.squeeze(0).cpu())
 
     #  Compute FAD (aggregate metric over all samples) 
     print(f"\nComputing FAD over {len(all_generated_wavs)} generated vs {len(all_reference_wavs)} reference samples...")
@@ -258,6 +276,8 @@ def parse_args():
                         help="Output directory")
     parser.add_argument("--soft_mask_transition", type=int, default=0,
                         help="Transition zone width in tokens (0=hard mask, 50≈1s at 50Hz)")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="Batch size for generating samples")
     parser.add_argument("--position_aware_cfg", action="store_true",
                         help="Position-aware CFG (stronger at gap center)")
     return parser.parse_args()
@@ -271,4 +291,5 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         soft_mask_transition=args.soft_mask_transition,
         position_aware_cfg=args.position_aware_cfg,
+        batch_size=args.batch_size,
     )

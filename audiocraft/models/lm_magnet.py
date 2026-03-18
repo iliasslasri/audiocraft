@@ -166,7 +166,9 @@ class MagnetLMModel(LMModel):
                          span_scoring='max',
                          span_arrangement='nonoverlap',
                          mask_end_idx=None,
-                         mask_start_idx=None) -> torch.Tensor:
+                         mask_start_idx=None,
+                         soft_mask_transition: int = 0,
+                         position_aware_cfg: bool = False) -> torch.Tensor:
         """Generate audio tokens given textual conditions, and optionally given audio prompts,
         by running MAGNeT's iterative decoding algorithm for each of the n_q RVQ levels.
         Args:
@@ -239,8 +241,11 @@ class MagnetLMModel(LMModel):
             gen_codes[..., :start_offset] = prompt
         else:
             assert mask_start_idx is not None, "Must provide start index for inpainting"
-            gen_codes[..., :mask_start_idx] = prompt[..., :mask_start_idx]
-            gen_codes[...,mask_end_idx:] = prompt[...,mask_end_idx:]
+            # With soft masking, widen the effective mask to include transition zones
+            eff_mask_start = max(0, mask_start_idx - soft_mask_transition) if soft_mask_transition > 0 else mask_start_idx
+            eff_mask_end = min(max_gen_len, mask_end_idx + soft_mask_transition) if soft_mask_transition > 0 else mask_end_idx
+            gen_codes[..., :eff_mask_start] = prompt[..., :eff_mask_start]
+            gen_codes[..., eff_mask_end:] = prompt[..., eff_mask_end:]
         # create the gen_sequence with proper interleaving from the pattern: [B, K, S]
         gen_sequence = gen_codes
 
@@ -265,8 +270,10 @@ class MagnetLMModel(LMModel):
                                                            curr_step=curr_step,
                                                            total_steps=sum(decoding_steps),
                                                            callback=callback,
-                                                           mask_start_idx=mask_start_idx, 
-                                                           mask_end_idx=mask_end_idx)
+                                                           mask_start_idx=mask_start_idx,
+                                                           mask_end_idx=mask_end_idx,
+                                                           soft_mask_transition=soft_mask_transition,
+                                                           position_aware_cfg=position_aware_cfg)
 
         return gen_sequence
 
@@ -292,7 +299,9 @@ class MagnetLMModel(LMModel):
                         total_steps: int = 0,
                         callback: tp.Optional[tp.Callable[[int, int], None]] = None,
                         mask_start_idx: tp.Optional[int] = None,
-                        mask_end_idx: tp.Optional[int] = None) -> tp.Tuple[torch.Tensor, int]:
+                        mask_end_idx: tp.Optional[int] = None,
+                        soft_mask_transition: int = 0,
+                        position_aware_cfg: bool = False) -> tp.Tuple[torch.Tensor, int]:
         """Generate audio tokens of a single RVQ level (stage), given the previously generated stages,
            and the textual conditions.
         Args:
@@ -328,6 +337,9 @@ class MagnetLMModel(LMModel):
 
         assert span_arrangement == 'nonoverlap' or span_arrangement == 'stride1'
         chunk_masking = self.span_len > 1 and span_arrangement == 'nonoverlap'
+        # Soft masking and position-aware CFG require token-level control
+        if chunk_masking and (soft_mask_transition > 0 or position_aware_cfg):
+            chunk_masking = False
 
         DONT_REMASK_ME_SCORE = -1e4
 
@@ -350,12 +362,33 @@ class MagnetLMModel(LMModel):
         else:
             # token-wise scores
             scores = torch.zeros(shape, dtype=torch.float32, device=device)
-            effective_start = mask_start_idx if mask_start_idx is not None else prompt_length
-            scores[..., :effective_start] = DONT_REMASK_ME_SCORE
-            
-            if mask_end_idx is not None:
-                scores[..., mask_end_idx:] = DONT_REMASK_ME_SCORE
-            gen_T = T - prompt_length if mask_start_idx is None else T - mask_start_idx - (T-mask_end_idx)
+            mask_weight = None  # Will be set if soft_mask_transition > 0
+
+            if soft_mask_transition > 0 and mask_start_idx is not None and mask_end_idx is not None:
+                # Build a [B, 1, T] weight tensor: 1.0 in core gap, cosine ramp in transitions, 0.0 outside
+                mask_weight = torch.zeros(shape, dtype=torch.float32, device=device)
+                mask_weight[..., mask_start_idx:mask_end_idx] = 1.0
+                # Left transition zone
+                left_start = max(0, mask_start_idx - soft_mask_transition)
+                if mask_start_idx > left_start:
+                    n_left = mask_start_idx - left_start
+                    ramp = 0.5 * (1 - torch.cos(torch.linspace(0, math.pi / 2, n_left, device=device)))
+                    mask_weight[..., left_start:mask_start_idx] = ramp
+                # Right transition zone
+                right_end = min(T, mask_end_idx + soft_mask_transition)
+                if right_end > mask_end_idx:
+                    n_right = right_end - mask_end_idx
+                    ramp = 0.5 * (1 + torch.cos(torch.linspace(0, math.pi / 2, n_right, device=device)))
+                    mask_weight[..., mask_end_idx:right_end] = ramp
+                # Initialize scores: lower weight => more negative (harder to remask)
+                scores = (1 - mask_weight) * DONT_REMASK_ME_SCORE
+                gen_T = max(1, int(mask_weight[0].sum().item()))
+            else:
+                effective_start = mask_start_idx if mask_start_idx is not None else prompt_length
+                scores[..., :effective_start] = DONT_REMASK_ME_SCORE
+                if mask_end_idx is not None:
+                    scores[..., mask_end_idx:] = DONT_REMASK_ME_SCORE
+                gen_T = T - prompt_length if mask_start_idx is None else T - mask_start_idx - (T - mask_end_idx)
 
         # run MAGNeT iterative decoding for "timesteps" iterations
         for timestep, steps_left in zip(torch.linspace(0, 1, timesteps, device=device), reversed(range(timesteps))):
@@ -389,10 +422,16 @@ class MagnetLMModel(LMModel):
             if prompt is not None:
                 if mask_end_idx is None:
                     stage_gen_seq[..., :prompt_length] = prompt[:, stage, :].unsqueeze(1)
+                elif soft_mask_transition > 0:
+                    # Only restore tokens fully outside the transition zones
+                    left_safe = max(0, mask_start_idx - soft_mask_transition)
+                    right_safe = min(T, mask_end_idx + soft_mask_transition)
+                    stage_gen_seq[..., :left_safe] = prompt[:, stage, :left_safe].unsqueeze(1)
+                    stage_gen_seq[..., right_safe:] = prompt[:, stage, right_safe:].unsqueeze(1)
                 else:
                     assert mask_start_idx is not None, "Must provide start index for inpainting"
                     stage_gen_seq[..., :mask_start_idx] = prompt[:, stage, :mask_start_idx].unsqueeze(1)
-                    stage_gen_seq[...,mask_end_idx:] = prompt[:,stage, mask_end_idx:].unsqueeze(1)
+                    stage_gen_seq[..., mask_end_idx:] = prompt[:, stage, mask_end_idx:].unsqueeze(1)
             gen_sequence[:, [stage], :] = stage_gen_seq
             if condition_tensors:
                 # duplicate input for classifier free guidance
@@ -404,7 +443,23 @@ class MagnetLMModel(LMModel):
                 # classifier free guidance with annealing
                 cond_logits, uncond_logits = all_logits.split(B, dim=0)  # [B, K, T, card]
                 clsfg_coef = float(mask_p) * max_cfg_coef + (1 - float(mask_p)) * min_cfg_coef
-                logits = uncond_logits + (cond_logits - uncond_logits) * clsfg_coef
+
+                if position_aware_cfg and mask_start_idx is not None and mask_end_idx is not None:
+                    # Position-aware CFG: stronger at gap center, weaker at boundaries
+                    gap_len = mask_end_idx - mask_start_idx
+                    if gap_len > 1:
+                        cfg_map = torch.full((1, 1, T, 1), clsfg_coef, device=device, dtype=cond_logits.dtype)
+                        gap_pos = torch.arange(gap_len, device=device, dtype=torch.float32)
+                        # Cosine profile: 0 at edges, 1 at center
+                        center_w = 0.5 * (1 - torch.cos(math.pi * gap_pos / (gap_len - 1)))
+                        # Blend from min_cfg_coef at boundary to clsfg_coef at center
+                        pos_cfg = min_cfg_coef + (clsfg_coef - min_cfg_coef) * center_w
+                        cfg_map[0, 0, mask_start_idx:mask_end_idx, 0] = pos_cfg
+                        logits = uncond_logits + (cond_logits - uncond_logits) * cfg_map
+                    else:
+                        logits = uncond_logits + (cond_logits - uncond_logits) * clsfg_coef
+                else:
+                    logits = uncond_logits + (cond_logits - uncond_logits) * clsfg_coef
             else:
                 logits = all_logits
 
@@ -450,7 +505,14 @@ class MagnetLMModel(LMModel):
             if chunk_masking:
                 scores = scores.masked_fill(~chunks_mask, DONT_REMASK_ME_SCORE)
             else:
-                scores = scores.masked_fill(~mask, DONT_REMASK_ME_SCORE)
+                if mask_weight is not None:
+                    # Soft transition: blend scores based on mask_weight
+                    # mask=True tokens keep their scores; others get weight-blended
+                    scores = torch.where(
+                        mask, scores,
+                        mask_weight * scores + (1 - mask_weight) * DONT_REMASK_ME_SCORE)
+                else:
+                    scores = scores.masked_fill(~mask, DONT_REMASK_ME_SCORE)
 
             if callback is not None:
                 curr_step += 1
